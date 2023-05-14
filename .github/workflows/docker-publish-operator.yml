@@ -7,10 +7,98 @@ on:
 
 permissions:
   contents: read
+env:
+  DEFAULT_JDK_VERSION: 17
+  DEFAULT_JDK_DIST: temurin
+  MINIKUBE_VERSION: v1.28.0
+  KUBERNETES_VERSION: v1.22.3
 
-jobs:        
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  # Only cancel jobs for PR updates
+  group: operator-ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+
+  conditional:
+    name: Check conditional workflows and jobs
+    if: github.event_name != 'schedule' || github.repository == 'keycloak/keycloak'
+    runs-on: ubuntu-latest
+    outputs:
+      operator: ${{ steps.conditional.outputs.operator }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - id: conditional
+        uses: ./.github/actions/conditional
+  build:
+    name: Build distribution
+    if: needs.conditional.outputs.operator == 'true'
+    runs-on: ubuntu-latest
+    needs: conditional
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Keycloak
+        uses: ./.github/actions/build-keycloak
+        with:
+          upload-m2-repo: false
+          upload-dist: true
+          
+  test-local:
+    name: Test local
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set version
+        id: vars
+        run: echo "version_local=0.0.1-${GITHUB_SHA::6}" >> $GITHUB_ENV
+
+      - uses: actions/setup-java@v3
+        with:
+          distribution: ${{ env.DEFAULT_JDK_DIST }}
+          java-version: ${{ env.DEFAULT_JDK_VERSION }}
+
+      - name: Setup Minikube-Kubernetes
+        uses: manusa/actions-setup-minikube@v2.7.2
+        with:
+          minikube version: ${{ env.MINIKUBE_VERSION }}
+          kubernetes version: ${{ env.KUBERNETES_VERSION }}
+          github token: ${{ secrets.GITHUB_TOKEN }}
+          driver: docker
+          start args: --addons=ingress
+
+      - name: Download keycloak distribution
+        id: download-keycloak-dist
+        uses: actions/download-artifact@v3
+        with:
+          name: keycloak-dist
+          path: quarkus/container
+
+      - name: Build Keycloak Docker images
+        run: |
+          eval $(minikube -p minikube docker-env)
+          (cd quarkus/container && docker build --build-arg KEYCLOAK_DIST=$(ls keycloak-*.tar.gz) . -t keycloak:${{ env.version_local }})
+          (cd operator && ./scripts/build-testing-docker-images.sh ${{ env.version_local }} keycloak custom-keycloak)
+
+      - name: Test operator running locally
+        run: |
+          mvn install -Poperator -pl :keycloak-operator -am \
+              -Dquarkus.kubernetes.image-pull-policy=IfNotPresent \
+              -Doperator.keycloak.image=keycloak:${{ env.version_local }} \
+              -Dtest.operator.custom.image=custom-keycloak:${{ env.version_local }} \
+              -Doperator.keycloak.image-pull-policy=Never \
+              -Dtest.operator.kubernetes.ip=$(minikube ip)
+              
   BuildandPushDocker:
     runs-on: [ubuntu-latest]
+    needs: [build,test-local]
     steps:    
     - uses: actions/checkout@v3
     - name: Set up QEMU
